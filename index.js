@@ -73,7 +73,7 @@ async function fetchFirstItem(token) {
   const rich = json?.cart_create?.body?.items?.[0];
   const item = rich || json?.resume_checkout?.body?.data?.itemList?.[0];
   if (!item) return null;
-  return { title: item.productName || item.name || item.title || "", image: normalizeImage(item) };
+  return { title: item.productName || item.name || item.title || "", image: normalizeImage(item),price: item.price ?? item.productPrice ?? item.salePrice ?? null };
 }
 
 // ---------- Routes ----------
@@ -92,6 +92,13 @@ app.get("/cart-image", async (req, res) => {
   if (!data || !data.image) return res.status(404).send("Image not found");
   res.redirect(302, data.image);
 });
+app.get("/cart-price", async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send("Missing token");
+  const data = await fetchFirstItem(token);
+  if (!data || data.price == null) return res.status(404).send("Price not found");
+  res.type("text/plain").send(String(data.price));
+});
 
 app.get("/debug", async (req, res) => {
   const token = req.query.token;
@@ -101,3 +108,11 @@ app.get("/debug", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🟢  Fastrr preview API running on ${PORT}`));
+
+
+
+
+
+
+
+
