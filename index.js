@@ -1,3 +1,5 @@
+// 
+
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
@@ -7,30 +9,20 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SHOP = (process.env.SHOP_DOMAIN || "").replace(/https?:\/\//, "").replace(/\/$/, "");
+
 if (!SHOP) {
-  console.error("❌  Set SHOP_DOMAIN in .env");
+  console.error("❌  Missing SHOP_DOMAIN in .env");
   process.exit(1);
 }
 
-/**************** Constants ****************/
-const FASTRR_BATCH = "https://edge.pickrr.com/batch/api/v1";
-const HEADERS = {
-  "Content-Type": "application/json",
-  Accept: "application/json",
-  "X-Device-Id": "fastrr"
-};
-const uIdB64 = Buffer.from(SHOP).toString("base64");
-
-/**************** Helpers ****************/
-const normalizeImage = (i) => i?.imageUrl || i?.image_url || i?.image || (i?.images?.[0] || "");
-const normalizeTitle = (i) => i?.productName || i?.name || i?.title || "";
-const normalizePrice = (i) => String(i?.price ?? i?.productPrice ?? i?.salePrice ?? i?.compareAtPrice ?? "");
-
-/**************** Batch payload (incl. seller_config) ****************/
-function buildItemPayload(token) {
+function buildBatchPayload(token) {
+  const uId = Buffer.from(SHOP).toString("base64");
   return {
     requests: [
-      { key: "session_create", input: { method: "GET", path: "/identity-service/session/create" } }
+      {
+        key: "session_create",
+        input: { method: "GET", path: "/identity-service/session/create" }
+      }
     ],
     next: {
       requests: [
@@ -39,7 +31,10 @@ function buildItemPayload(token) {
           input: {
             method: "GET",
             path: "/aggregator/api/ve1/aggregator-service/seller/config",
-            headers: { uId: uIdB64, "Pim-Sid": "{{session_create$.headers.pim-sid}}" }
+            headers: {
+              uId,
+              "Pim-Sid": "{{session_create$.headers.pim-sid}}"
+            }
           }
         }
       ],
@@ -50,7 +45,10 @@ function buildItemPayload(token) {
             input: {
               method: "GET",
               path: `/aggregator/api/ve1/aggregator-service/abandon-checkout/?id=${token}&type=report`,
-              headers: { uId: uIdB64, "Pim-Sid": "{{session_create$.headers.pim-sid}}" }
+              headers: {
+                uId,
+                "Pim-Sid": "{{session_create$.headers.pim-sid}}"
+              }
             }
           }
         ],
@@ -65,15 +63,7 @@ function buildItemPayload(token) {
                   "Pim-Sid": "{{session_create$.headers.pim-sid}}",
                   Sid: "{{seller_config$.body.data.id}}"
                 },
-                body: `{
-                          "items": {{resume_checkout$.body.data.itemList}},
-                          "forceCreate": true,
-                          "channel": "SHOPIFY",
-                          "fields": { "referenceId": "${token}" },
-                          "cartAttributes": {
-                            "landing_page_url": "https://${SHOP}/"
-                            }
-                        }`
+                body: `{"items":{{resume_checkout$.body.data.itemList}},"forceCreate":true,"channel":"SHOPIFY","fields":{"referenceId":"${token}"}}`
               }
             }
           ]
@@ -83,71 +73,69 @@ function buildItemPayload(token) {
   };
 }
 
-/**************** Network ***************/
-async function fetchBatch(payload) {
-  const resp = await fetch(FASTRR_BATCH, {
+const normalizeImage = i =>
+  i.imageUrl || i.image_url || i.image || (Array.isArray(i.images) && i.images[0]) || "";
+
+async function fetchFirstItem(token) {
+  const resp = await fetch("https://edge.pickrr.com/batch/api/v1", {
     method: "POST",
-    headers: HEADERS,
-    body: JSON.stringify(payload)
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "X-Device-Id": "fastrr"
+    },
+    body: JSON.stringify(buildBatchPayload(token))
   });
-  if (!resp.ok) {
-    const text = await resp.text();
-    console.error("Fastrr status", resp.status, text.slice(0, 300));
-    return null;
-  }
+  if (!resp.ok) return null;
   const raw = await resp.json();
-  return raw.data ?? raw;
+  const json = raw.data ?? raw;
+  const rich = json?.cart_create?.body?.items?.[0];
+  const item = rich || json?.resume_checkout?.body?.data?.itemList?.[0];
+  if (!item) return null;
+  return {
+    title: item.productName || item.name || item.title || "",
+    image: normalizeImage(item),
+    price: item.price ?? item.productPrice ?? item.salePrice ?? null
+  };
 }
 
-async function getItem(token) {
-  const json = await fetchBatch(buildItemPayload(token));
-  return json?.cart_create?.body?.items?.[0] || null;
-}
-
-/**************** Routes ****************/
+// ---------- Routes ----------
 app.get("/cart-title", async (req, res) => {
-  const { token } = req.query;
+  const token = req.query.token;
   if (!token) return res.status(400).send("Missing token");
-  const item = await getItem(token);
-  if (!item) return res.status(404).send("Cart empty");
-  res.type("text/plain").send(normalizeTitle(item));
+  const data = await fetchFirstItem(token);
+  if (!data) return res.status(404).send("Cart not found or empty");
+  res.type("text/plain").send(data.title);
+});
+
+app.get("/cart-image", async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(400).send("Missing token");
+  const data = await fetchFirstItem(token);
+  if (!data || !data.image) return res.status(404).send("Image not found");
+  res.redirect(302, data.image);
 });
 
 app.get("/cart-price", async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send("Missing token");
-  const item = await getItem(token);
-  if (!item) return res.status(404).send("Cart empty");
-  const price = normalizePrice(item);
-  if (!price) return res.status(404).send("Price not found");
-  res.type("text/plain").send(price);
-});
-
-app.get("/cart-image", async (req, res) => {
-  const { token } = req.query;
-  if (!token) return res.status(400).send("Missing token");
-  const item = await getItem(token);
-  const imgUrl = normalizeImage(item);
-  if (!imgUrl) return res.status(404).send("Image not found");
-
-  try {
-    const imgResp = await fetch(imgUrl);
-    if (!imgResp.ok) throw new Error(`CDN status ${imgResp.status}`);
-    const buffer = Buffer.from(await imgResp.arrayBuffer());
-    res.setHeader("Content-Type", imgResp.headers.get("content-type") || "image/jpeg");
-    res.setHeader("Content-Length", buffer.length);
-    res.end(buffer);
-  } catch (err) {
-    console.error("Image fetch error", err);
-    res.status(502).send("Unable to fetch image");
-  }
+  const data = await fetchFirstItem(token);
+  if (!data || data.price == null) return res.status(404).send("Price not found");
+  res.type("text/plain").send(String(data.price));
 });
 
 app.get("/debug", async (req, res) => {
-  const { token } = req.query;
+  const token = req.query.token;
   if (!token) return res.status(400).send("Missing token");
-  const json = await fetchBatch(buildItemPayload(token));
-  res.json(json || { error: "No data" });
+  const r = await fetch("https://edge.pickrr.com/batch/api/v1", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Device-Id": "fastrr"
+    },
+    body: JSON.stringify(buildBatchPayload(token))
+  });
+  res.status(r.status).json(await r.json());
 });
 
-app.listen(PORT, () => console.log(`🟢  API v2.3.2 running on :${PORT}`));
+app.listen(PORT, () => console.log(`🟢  Fastrr preview API running on ${PORT}`));
